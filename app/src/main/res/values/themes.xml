@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.SUNINGANGHO2" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF16131C</item>
+        <item name="android:statusBarColor">#FF16131C</item>
+        <item name="android:navigationBarColor">#FF16131C</item>
+    </style>
+</resources>
