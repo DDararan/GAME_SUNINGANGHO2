@@ -4,6 +4,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlin.math.floor
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.random.Random
 
 /** 길 위에 있는 동안 */
@@ -26,7 +27,7 @@ data class GameState(
     val at: String? = WorldMap.START,
     val travel: Travel? = null,
     /** 자동 방랑: 이 장소에 더 머물 날수 */
-    val stay: Double = 2.0,
+    val stay: Double = 0.3,
     /** 지정한 목적지 */
     val destination: String? = null,
     /** 지정한 목적지에 닿아 머무는 중 (자동으로 떠나지 않는다) */
@@ -37,6 +38,10 @@ data class GameState(
     val visited: Set<String> = setOf(WorldMap.START),
     val fight: Fight? = null,
     val pending: List<Pending> = emptyList(),
+    /** 지도 위에서 벌어지는 일들 */
+    val incidents: List<Incident> = emptyList(),
+    val nextIncidentAt: Double = 0.02,
+    val nextIncidentId: Int = 1,
     val log: List<LogEntry> = emptyList(),
     /** 마지막으로 저장한 실제 시각 */
     val savedAt: Long = 0,
@@ -115,14 +120,18 @@ object RoadEvents {
 
 /** 하루하루 흐르는 강호 (기획서 1~4장) */
 object Game {
-    const val ENCOUNTER = 0.12
+    const val ENCOUNTER = 0.35
     const val MAX_PENDING = 3
     const val MAX_LOG = 150
     const val HEAL_PER_DAY = 0.25
     const val RECOVER_DAYS = 3.0
 
-    fun new(name: String, random: Random): GameState =
-        GameState(Hero.roll(name, random)).log("${Hero.START_AGE}세, 청운촌을 나서 강호로 간다.")
+    fun new(name: String, random: Random): GameState {
+        var s = GameState(Hero.roll(name, random)).log("${Hero.START_AGE}세, 청운촌을 나서 강호로 간다.")
+        // 처음부터 강호 곳곳에서 일이 벌어지고 있다
+        repeat(4) { s = spawnIncident(s, random) }
+        return s
+    }
 
     private fun GameState.log(text: String): GameState =
         copy(log = (log + LogEntry(day.toInt(), text)).takeLast(MAX_LOG))
@@ -142,10 +151,12 @@ object Game {
                 continue
             }
             val toNextDay = floor(s.day) + 1 - s.day
-            val dt = min(left, toNextDay)
+            val toIncident = (s.nextIncidentAt - s.day).coerceAtLeast(1e-6)
+            val dt = min(left, min(toNextDay, toIncident))
             s = flow(s, dt, random)
             left -= dt
             if (dt >= toNextDay - 1e-9) s = daily(s.copy(day = floor(s.day + 1e-6)), random)
+            if (s.day >= s.nextIncidentAt - 1e-9) s = spawnIncident(s, random)
         }
         return s
     }
@@ -153,12 +164,23 @@ object Game {
     /** 시간에 따라 이어지는 것: 회복, 걷기, 머물기 */
     private fun flow(start: GameState, dt: Double, random: Random): GameState {
         val h = start.hero
-        var s = start.copy(day = start.day + dt, hero = h.copy(hp = min(h.maxHp, h.currentHp() + h.maxHp * HEAL_PER_DAY * dt)))
+        val day = start.day + dt
+        var s = start.copy(
+            day = day,
+            hero = h.copy(hp = min(h.maxHp, h.currentHp() + h.maxHp * HEAL_PER_DAY * dt)),
+            incidents = start.incidents.filter { it.end > day },
+        )
         if (s.recover > 0) return s.copy(recover = (s.recover - dt).coerceAtLeast(0.0))
         val t = s.travel
         if (t != null) {
             val moved = t.copy(progress = t.progress + dt)
-            return if (moved.progress >= moved.total) arrive(s, moved, random) else s.copy(travel = moved)
+            // 길 위의 사건(습격·맹수)이 있는 곳을 지나면 휘말린다
+            val hit = s.incidents.firstOrNull { inc ->
+                (inc.kind == IncidentKind.RAID || inc.kind == IncidentKind.BEAST) && inc.onRoad(t.from, t.to) &&
+                    (if (inc.roadA == t.from) inc.at else 1 - inc.at).let { mark -> t.progress / t.total < mark && moved.progress / moved.total >= mark }
+            }
+            if (hit != null) return roadIncident(s.copy(travel = moved), hit, random)
+            return if (moved.progress >= moved.total) visit(arrive(s, moved, random), random) else s.copy(travel = moved)
         }
         if (s.hold) return s
         s = s.copy(stay = s.stay - dt)
@@ -173,7 +195,8 @@ object Game {
             return s.copy(hero = h.copy(alive = false)).log("${s.ageYears}세, 천수를 다했다. 강호를 떠도는 길이 여기서 끝난다.")
         }
         val t = s.travel
-        if (t != null && s.recover <= 0 && random.nextDouble() < ENCOUNTER) s = encounter(s, t, random)
+        val patrolled = t != null && s.incidents.any { it.kind == IncidentKind.PATROL && it.onRoad(t.from, t.to) }
+        if (t != null && !patrolled && s.recover <= 0 && random.nextDouble() < ENCOUNTER) s = encounter(s, t, random)
         while (s.hero.realm < Realms.last && s.hero.inner >= Realms.breakthroughCost(s.hero.realm)) {
             val hero = s.hero
             val next = hero.copy(inner = hero.inner - Realms.breakthroughCost(hero.realm), realm = hero.realm + 1, hp = -1.0)
@@ -231,16 +254,16 @@ object Game {
         return when {
             s.destination == t.to -> base.copy(destination = null, hold = true).log("목적지 ${Josa.e(place.name)} 닿았다. 이곳에 머문다.$firstText")
             s.destination != null -> base.copy(stay = 0.3).log("${Josa.eul(place.name)} 지난다.$firstText")
-            else -> base.copy(stay = random.nextDouble(3.0, 8.0)).log("${Josa.e(place.name)} 닿았다.$firstText")
+            else -> base.copy(stay = random.nextDouble(1.0, 3.0)).log("${Josa.e(place.name)} 닿았다.$firstText")
         }
     }
 
     private fun depart(s: GameState, random: Random): GameState {
         val here = s.at ?: return s
         val next = nextStop(s, here, random) ?: return s.copy(stay = 1.0)
-        val days = WorldMap.roadDays(here, next).toDouble()
+        val days = WorldMap.roadDays(here, next)
         val name = WorldMap.place(next).name
-        return s.copy(at = null, travel = Travel(here, next, 0.0, days)).log("${Josa.ro(name)} 길을 나섰다. (${days.toInt()}일)")
+        return s.copy(at = null, travel = Travel(here, next, 0.0, days)).log("${Josa.ro(name)} 길을 나섰다.")
     }
 
     /** 다음 행선지: 목적지가 있으면 최단 경로, 없으면 방랑 (안 가 본 곳을 좋아하고, 너무 위험한 곳은 피한다) */
@@ -249,7 +272,8 @@ object Game {
         val all = WorldMap.neighbors(here)
         val safe = all.filter { FightSim.dangerRealm(WorldMap.place(it).danger) <= s.hero.realm + 1 }.ifEmpty { listOf(all.minBy { WorldMap.place(it).danger }) }
         val weights = safe.map { id ->
-            (if (id in s.visited) 1.0 else 3.0) * (if (id == s.cameFrom && safe.size > 1) 0.3 else 1.0)
+            val lively = s.incidents.any { it.place == id || it.onRoad(here, id) }
+            (if (id in s.visited) 1.0 else 3.0) * (if (id == s.cameFrom && safe.size > 1) 0.3 else 1.0) * (if (lively) 4.0 else 1.0)
         }
         var roll = random.nextDouble() * weights.sum()
         for ((i, id) in safe.withIndex()) {
@@ -257,6 +281,55 @@ object Game {
             if (roll <= 0) return id
         }
         return safe.last()
+    }
+
+    // ── 지도 위 사건 ──
+
+    private fun spawnIncident(s: GameState, random: Random): GameState {
+        val next = s.copy(nextIncidentAt = s.day + Incidents.gap(random))
+        if (s.incidents.size >= Incidents.MAX_ACTIVE) return next
+        val inc = Incidents.spawn(s.nextIncidentId, s.day, s.incidents, random, s.position()) ?: return next
+        return next.copy(incidents = next.incidents + inc, nextIncidentId = s.nextIncidentId + 1)
+    }
+
+    /** 길 위 사건에 휘말렸다: 습격·맹수는 싸움 */
+    private fun roadIncident(s: GameState, inc: Incident, random: Random): GameState {
+        val danger = WorldMap.roadDanger(inc.roadA!!, inc.roadB!!)
+        val base = FightSim.roadFight(s.hero, danger, random)
+        val f = when (inc.kind) {
+            IncidentKind.RAID -> base.copy(enemy = base.enemy.copy(name = "산적 떼", sprite = "bandit"), silver = base.silver * 3)
+            else -> base.copy(enemy = base.enemy.copy(name = "굶주린 늑대", sprite = "wolf", interval = 0.8), inner = base.inner * 2)
+        }
+        val text = if (inc.kind == IncidentKind.RAID) "산적 떼가 상단을 덮친 자리에 끼어들었다!" else "굶주린 늑대 떼와 마주쳤다!"
+        return s.copy(fight = f, incidents = s.incidents - inc).log(text)
+    }
+
+    /** 장소에 닿았을 때 그곳의 사건 */
+    private fun visit(s: GameState, random: Random): GameState {
+        val here = s.at ?: return s
+        val inc = s.incidents.firstOrNull { it.place == here } ?: return s
+        val d = WorldMap.place(here).danger
+        val h = s.hero
+        val rest = s.copy(incidents = s.incidents - inc)
+        return when (inc.kind) {
+            IncidentKind.FESTIVAL -> rest.copy(hero = h.copy(hp = -1.0, inner = h.inner + 3.0 * d)).log("잔치에서 배불리 먹고 마셨다. 기혈이 가득 찼다. (내공 +${3 * d})")
+            IncidentKind.MARKET -> {
+                val pay = 10 * d + random.nextInt(0, 11)
+                rest.copy(hero = h.copy(silver = h.silver + pay)).log("장날 짐을 날라 주었다. 품삯 은자 +$pay")
+            }
+            IncidentKind.FIRE -> rest.copy(hero = h.copy(silver = h.silver + 5 * d, inner = h.inner + 2.0 * d)).log("불을 끄는 걸 도왔다. 사람들이 고마워하며 은자 ${5 * d}냥을 쥐여 주었다.")
+            IncidentKind.MASTER -> {
+                val gain = Realms.breakthroughCost(h.realm) * 0.3
+                rest.copy(hero = h.copy(inner = h.inner + gain)).log("기인에게 한 수 배웠다. 막혔던 혈이 트인다. (내공 +${gain.toInt()})")
+            }
+            IncidentKind.TOURNAMENT -> {
+                val realm = h.realm
+                val scale = 2.0.pow(realm) * random.nextDouble(0.75, 0.9)
+                val foe = Fighter("비무대회 고수", "chief", 50 * scale, 50 * scale, 5 * scale, 1.1)
+                rest.copy(fight = Fight(FightSim.heroFighter(h), foe, (60 * 1.5.pow(d)).toInt(), 5.0 * d)).log("비무대회에 나섰다!")
+            }
+            else -> s
+        }
     }
 
     // ── 손으로 하는 일 ──

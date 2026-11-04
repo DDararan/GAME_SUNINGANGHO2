@@ -13,6 +13,14 @@ class Frame(val w: Int, val h: Int) {
         px[y * w + x] = color
     }
 
+    /** 그 자리 색을 어둡게 (그림자) */
+    fun shade(x: Int, y: Int, amount: Double = 0.4) {
+        if (x < 0 || y < 0 || x >= w || y >= h) return
+        val c = px[y * w + x]
+        fun ch(shift: Int) = (((c shr shift) and 0xFF) * (1 - amount)).toInt()
+        px[y * w + x] = (0xFF shl 24) or (ch(16) shl 16) or (ch(8) shl 8) or ch(0)
+    }
+
     fun rect(x: Int, y: Int, rw: Int, rh: Int, color: Int) {
         for (yy in y until y + rh) for (xx in x until x + rw) set(xx, yy, color)
     }

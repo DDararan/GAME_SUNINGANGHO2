@@ -21,7 +21,7 @@ class GameTest {
         val route = WorldMap.path("cheongun", "namhae")
         assertEquals("cheongun", route.first())
         assertEquals("namhae", route.last())
-        assertTrue(WorldMap.pathDays(route) in 15..40)
+        assertTrue(WorldMap.pathDays(route) in 2.0..8.0)
     }
 
     @Test
@@ -77,6 +77,20 @@ class GameTest {
         assertTrue("경지가 오른다: ${s.hero.realm}", s.hero.realm >= 1)
         println("1년: 경지 ${Realms.name(s.hero.realm)}, ${s.hero.wins}승 ${s.hero.losses}패, 은자 ${s.hero.silver}, 다녀간 곳 ${s.visited.size}")
         assertEquals(s, SaveCodec.decode(SaveCodec.encode(s)))
+    }
+
+    @Test
+    fun incidentsComeAndGo() {
+        val s = Game.advance(fresh(3), 5.0, Random(3), live = false)
+        assertTrue("사건이 생긴다", s.nextIncidentId > 10)
+        assertTrue(s.incidents.size <= Incidents.MAX_ACTIVE)
+        assertTrue("오래된 사건은 끝난다", s.incidents.all { it.end > s.day })
+        // 잔치가 열린 마을에 닿으면 기혈이 찬다
+        val party = Incident(99, IncidentKind.FESTIVAL, place = "hayang", start = 0.0, end = 5.0)
+        val hurt = fresh().copy(hero = fresh().hero.copy(hp = 1.0), incidents = listOf(party), nextIncidentAt = 99.0)
+        val arrived = Game.advance(Game.setDestination(hurt, "hayang"), 2.0, Random(1), live = false)
+        assertTrue(arrived.log.any { "잔치" in it.text })
+        assertTrue(arrived.incidents.none { it.id == 99 })
     }
 
     @Test
